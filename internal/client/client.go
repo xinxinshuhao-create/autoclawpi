@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hirotomasato/autoclawpi/internal/sign"
@@ -23,16 +25,67 @@ type Client struct {
 	InferenceBase string // https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw
 	UserAPIBase   string // https://autoglm-api.autoglm.ai
 	Version       string
+
+	// proxyMu melindungi transportCache.
+	proxyMu sync.Mutex
+	// transportCache memetakan proxyURL -> *http.Transport.
+	// Transport di-cache supaya koneksi bisa dipakai ulang (keep-alive) dan
+	// tidak membuat Transport baru tiap request (itu membocorkan koneksi).
+	transportCache map[string]*http.Transport
 }
 
 // New membuat client dengan default yang masuk akal.
 func New(inferenceBase, userAPIBase string) *Client {
 	return &Client{
-		HTTP:          &http.Client{Timeout: 0},
-		InferenceBase: inferenceBase,
-		UserAPIBase:   userAPIBase,
-		Version:       "1.17.9",
+		HTTP:           &http.Client{Timeout: 0},
+		InferenceBase:  inferenceBase,
+		UserAPIBase:    userAPIBase,
+		Version:        "1.17.9",
+		transportCache: make(map[string]*http.Transport),
 	}
+}
+
+// HTTPFor mengembalikan http.Client untuk akun dengan proxy tertentu.
+//
+// proxyURL kosong → pakai c.HTTP (perilaku lama, tanpa proxy).
+// proxyURL terisi → pakai Transport khusus yang di-cache per proxyURL,
+// sehingga tiap akun keluar lewat IP-nya sendiri tanpa membuat koneksi baru
+// setiap request.
+func (c *Client) HTTPFor(proxyURL string) *http.Client {
+	if proxyURL == "" {
+		return c.HTTP
+	}
+	c.proxyMu.Lock()
+	defer c.proxyMu.Unlock()
+	if c.transportCache == nil {
+		c.transportCache = make(map[string]*http.Transport)
+	}
+	if tr, ok := c.transportCache[proxyURL]; ok {
+		return &http.Client{Transport: tr, Timeout: 0}
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		// URL rusak → jangan diam-diam direct (itu membocorkan IP asli);
+		// pakai transport yang selalu gagal supaya terlihat di log.
+		tr := &http.Transport{Proxy: func(*http.Request) (*url.URL, error) {
+			return nil, fmt.Errorf("proxy URL tidak valid: %s", proxyURL)
+		}}
+		c.transportCache[proxyURL] = tr
+		return &http.Client{Transport: tr, Timeout: 0}
+	}
+	// Clone DefaultTransport agar tetap dapat tuning default (timeout, http2,
+	// keep-alive) lalu ganti hanya bagian Proxy.
+	base, _ := http.DefaultTransport.(*http.Transport)
+	tr := base.Clone()
+	tr.Proxy = http.ProxyURL(u)
+	c.transportCache[proxyURL] = tr
+	return &http.Client{Transport: tr, Timeout: 0}
+}
+
+// DoFor melakukan request memakai client sesuai proxy akun.
+func (c *Client) DoFor(req *http.Request, proxyURL string) (*http.Response, error) {
+	req.Header.Set("User-Agent", "AutoClaw/"+c.Version)
+	return c.HTTPFor(proxyURL).Do(req)
 }
 
 // deviceID mengembalikan ID perangkat persisten.
@@ -123,11 +176,11 @@ type CaptchaConfigResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data *struct {
-		Enabled   bool   `json:"enabled"`
-		Region    string `json:"region"`
-		Prefix    string `json:"prefix"`
-		SceneID   string `json:"scene_id"`
-		Supplier  string `json:"captcha_supplier"`
+		Enabled  bool   `json:"enabled"`
+		Region   string `json:"region"`
+		Prefix   string `json:"prefix"`
+		SceneID  string `json:"scene_id"`
+		Supplier string `json:"captcha_supplier"`
 	} `json:"data"`
 }
 
@@ -158,26 +211,54 @@ func (c *Client) Login(ctx context.Context, vendor, code, state, navigateURI str
 
 // Refresh memperbarui access token pakai refresh token.
 func (c *Client) Refresh(ctx context.Context, refreshToken string) (*LoginResponse, error) {
+	return c.RefreshVia(ctx, refreshToken, "")
+}
+
+// RefreshVia sama seperti Refresh tapi lewat proxy akun, supaya permintaan
+// refresh juga keluar dari IP akun tersebut (konsisten dengan inference dan
+// tidak membocorkan IP asli).
+func (c *Client) RefreshVia(ctx context.Context, refreshToken, proxyURL string) (*LoginResponse, error) {
 	body := map[string]any{
 		"refresh_token": refreshToken,
 		"device_id":     deviceID(),
 		"source_id":     "autoclaw",
 	}
 	var out LoginResponse
-	if err := c.userapiPost(ctx, "/userapi/v1/agent-refresh", body, &out); err != nil {
+	if err := c.userapiPostVia(ctx, "/userapi/v1/agent-refresh", body, &out, proxyURL); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
+// agentdrHeader menyiapkan header untuk endpoint /agentdr/* dan userapi:
+// authorization lowercase tanpa prefix "Bearer", plus signature X-Auth-*.
+func agentdrHeader(token string) map[string]string {
+	h := sign.HeadersAt(time.Now().Unix())
+	h["X-Lang"] = "en"
+	h["X-Client-Type"] = "pc"
+	h["authorization"] = token // lowercase, tanpa Bearer
+	delete(h, "Accept")
+	return h
+}
+
 // ClaimTask mengklaim task check-in (daily_signin, dll).
-// Token harus sudah include "Bearer " prefix.
+// Header pakai X-Authorization (uppercase) + signature inference.
 func (c *Client) ClaimTask(ctx context.Context, token, taskID string) (int, bool, error) {
+	return c.claimTask(ctx, token, taskID, "")
+}
+
+// ClaimTaskVia sama seperti ClaimTask tapi lewat proxy akun, supaya tiap akun
+// keluar dari IP-nya sendiri (bukan IP default yang dipakai bersama).
+func (c *Client) ClaimTaskVia(ctx context.Context, token, taskID, proxyURL string) (int, bool, error) {
+	return c.claimTask(ctx, token, taskID, proxyURL)
+}
+
+func (c *Client) claimTask(ctx context.Context, token, taskID, proxyURL string) (int, bool, error) {
 	hdrs := c.InferenceHeader(token, "")
 	// Tambah header yang diperlukan userapi
 	hdrs["X-Lang"] = "en"
 	hdrs["X-Client-Type"] = "pc"
-	hdrs["authorization"] = token // lowercase untuk userapi
+	hdrs["authorization"] = token   // lowercase untuk userapi
 	delete(hdrs, "X-Authorization") // inference header gak dipake
 
 	body := fmt.Sprintf(`{"task_id":"%s"}`, taskID)
@@ -192,7 +273,7 @@ func (c *Client) ClaimTask(ctx context.Context, token, taskID string) (int, bool
 		req.Header.Set(k, v)
 	}
 
-	resp, err := c.Do(req)
+	resp, err := c.DoFor(req, proxyURL)
 	if err != nil {
 		return 0, false, err
 	}
@@ -218,6 +299,122 @@ func (c *Client) ClaimTask(ctx context.Context, token, taskID string) (int, bool
 		return 0, false, fmt.Errorf("server: success=false")
 	}
 	return result.Data.RewardPoints, false, nil
+}
+
+// InspirationItem adalah satu entri di inspiration center.
+type InspirationItem struct {
+	InspirationID string `json:"inspiration_id"`
+	Title         string `json:"title"`
+	RewardPoints  int    `json:"reward_points"`
+}
+
+// InspirationCenter mengambil daftar inspirasi. Dipakai untuk task
+// daily_inspiration_center: ambil inspiration_id dulu, baru klaim reward-nya.
+func (c *Client) InspirationCenter(ctx context.Context, token, proxyURL string) ([]InspirationItem, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.UserAPIBase+"/agentdr/v1/assistant/inspiration-center", strings.NewReader("{}"))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range agentdrHeader(token) {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.DoFor(req, proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			List []InspirationItem `json:"list"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("payload bukan JSON: %s", truncate(b, 200))
+	}
+	if out.Code != 0 {
+		return nil, fmt.Errorf("code %d: %s", out.Code, out.Msg)
+	}
+	return out.Data.List, nil
+}
+
+// ClaimInspirationReward mengklaim reward daily_inspiration_center.
+//
+// PENTING: endpoint & payload beda dari ClaimTask. Yang benar adalah
+// /agentdr/v1/assistant/inspiration-task-complete dengan
+// {"inspiration_id": "<uuid>"} — bukan /autoclaw-proxy/.../autoclaw-task-complete
+// dengan task_id (itu bikin reward 0 dan status task jadi "completed" palsu).
+//
+// Return already=true kalau server bilang 560118 (sudah pernah diklaim).
+func (c *Client) ClaimInspirationReward(ctx context.Context, token, inspirationID, proxyURL string) (bool, error) {
+	body, _ := json.Marshal(map[string]string{"inspiration_id": inspirationID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.UserAPIBase+"/agentdr/v1/assistant/inspiration-task-complete", bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+	for k, v := range agentdrHeader(token) {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.DoFor(req, proxyURL)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return false, fmt.Errorf("payload bukan JSON: %s", truncate(b, 200))
+	}
+	switch out.Code {
+	case 0:
+		return false, nil
+	case 560118:
+		return true, nil // sudah diklaim
+	case 560117:
+		return false, fmt.Errorf("retryable (code 560117): %s", out.Msg)
+	}
+	return false, fmt.Errorf("code %d: %s", out.Code, out.Msg)
+}
+
+// FetchBalance mengambil saldo wallet akun (via proxy kalau diisi).
+func (c *Client) FetchBalance(ctx context.Context, token, proxyURL string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.UserAPIBase+"/agent-assetmgr/api/v1/wallet-instances?biz_app_id=autoclaw", nil)
+	if err != nil {
+		return 0, err
+	}
+	for k, v := range agentdrHeader(token) {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.DoFor(req, proxyURL)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var r struct {
+		Data *struct {
+			TotalBalance int `json:"total_balance"`
+		} `json:"data"`
+	}
+	json.Unmarshal(b, &r)
+	if r.Data == nil {
+		return 0, fmt.Errorf("response: %s", truncate(b, 200))
+	}
+	return r.Data.TotalBalance, nil
 }
 
 // ClaimNewbieToken mengklaim token newbie guide (reward 100M token untuk akun baru).
@@ -298,7 +495,16 @@ func (c *Client) userapiPost(ctx context.Context, path string, body any, out any
 	return c.userapiPostWithHeaders(ctx, path, body, out, sign.Headers())
 }
 
+// userapiPostVia sama seperti userapiPost tapi lewat proxy tertentu.
+func (c *Client) userapiPostVia(ctx context.Context, path string, body any, out any, proxyURL string) error {
+	return c.userapiPostWithHeadersVia(ctx, path, body, out, sign.Headers(), proxyURL)
+}
+
 func (c *Client) userapiPostWithHeaders(ctx context.Context, path string, body any, out any, hdrs map[string]string) error {
+	return c.userapiPostWithHeadersVia(ctx, path, body, out, hdrs, "")
+}
+
+func (c *Client) userapiPostWithHeadersVia(ctx context.Context, path string, body any, out any, hdrs map[string]string, proxyURL string) error {
 	var buf bytes.Buffer
 	if body != nil {
 		if err := json.NewEncoder(&buf).Encode(body); err != nil {
@@ -316,11 +522,15 @@ func (c *Client) userapiPostWithHeaders(ctx context.Context, path string, body a
 	req.Header.Set("X-Lang", "en")
 	req.Header.Set("X-Client-Type", "pc")
 	// Note: Token is NOT added here - it's only used for inference and agentdr endpoints
-	return c.doJSON(req, out)
+	return c.doJSONVia(req, out, proxyURL)
 }
 
 func (c *Client) doJSON(req *http.Request, out any) error {
-	resp, err := c.Do(req)
+	return c.doJSONVia(req, out, "")
+}
+
+func (c *Client) doJSONVia(req *http.Request, out any, proxyURL string) error {
+	resp, err := c.DoFor(req, proxyURL)
 	if err != nil {
 		return err
 	}
@@ -348,21 +558,29 @@ func truncate(b []byte, n int) string {
 }
 
 // InferenceHeader membangun header untuk proxy inference.
+//
+// CATATAN (2026-09-15): header "X-Tm" WAJIB berisi platform desktop
+// (windows/pc/darwin/mac/android/ios). Nilai "linux" memicu WAF hard block
+// 403 {"message":"forbidden"} di gateway inference. Diverifikasi lewat
+// matriks header: X-Tm=linux -> 403 (3/3), X-Tm=windows/win/pc/darwin/
+// android/ios/"" -> 200. Hanya endpoint inference yang terpengaruh;
+// userapi (sign.go) tetap pakai "linux" dan berjalan normal.
+// "X-Harness-Type" juga wajib ada — tanpa itu gateway balas 400 invalid request.
 func (c *Client) InferenceHeader(accessToken, routeModelID string) map[string]string {
 	tok := accessToken
 	if !strings.HasPrefix(tok, "Bearer ") {
 		tok = "Bearer " + tok
 	}
 	return map[string]string{
-		"X-Authorization":  tok,
-		"X-Request-Id":     sign.UUID(),
-		"X-Request-Model":  routeModelID,
-		"X-Product":        "autoclaw",
-		"X-Harness-Type":   "zcode",
-		"X-Tm":             "linux",
-		"X-Version":        c.Version,
-		"X-Lang":           "id",
-		"x_trace_id":       sign.UUID(),
+		"X-Authorization": tok,
+		"X-Request-Id":    sign.UUID(),
+		"X-Request-Model": routeModelID,
+		"X-Product":       "autoclaw",
+		"X-Harness-Type":  "zcode",
+		"X-Tm":            "windows",
+		"X-Version":       c.Version,
+		"X-Lang":          "id",
+		"x_trace_id":      sign.UUID(),
 	}
 }
 

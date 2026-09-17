@@ -31,39 +31,64 @@ func cmdLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	vendor := fs.String("vendor", "zai", "oauth: zai | google")
 	port := fs.Int("port", 0, "port lokal (0 = pilih dari ALL_PORTS 18432/19654/19723/53699)")
+	noBrowser := fs.Bool("no-browser", false, "jangan buka browser otomatis; cetak URL saja (buka manual)")
+	// Default = TAMBAH akun baru (pool mode, seperti channel CPA lain).
+	// --replace untuk menimpa akun pertama (perilaku lama, harus eksplisit).
+	replace := fs.Bool("replace", false, "TIMPA akun pertama (default: tambah akun baru)")
+	name := fs.String("name", "", "nama akun baru (default: user_name dari login)")
+	timeoutMin := fs.Int("timeout", 20, "batas waktu tunggu login (menit); captcha+OAuth+callback")
+	proxyURL := fs.String("proxy", "", "proxy khusus akun ini (mis. http://127.0.0.1:7901); kosong = ambil dari ip-pool.json")
 	fs.Parse(args)
 
 	cfg, cl := loadAll()
 	loginPort := *port
 
-	// 1) captcha config
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	capCfg, err := cl.CaptchaConfig(ctx)
+	// 1) captcha config — panggilan API biasa, timeout pendek saja.
+	capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	capCfg, err := cl.CaptchaConfig(capCtx)
+	capCancel()
 	if err != nil {
 		return fmt.Errorf("captcha config: %w", err)
 	}
 	fmt.Printf("captcha: supplier=%s enabled=%v scene=%s\n",
 		capCfg.Data.Supplier, capCfg.Data.Enabled, capCfg.Data.SceneID)
 
+	// ctx terpisah untuk fase INTERAKTIF (captcha solve + login + callback).
+	// Dulu satu ctx 5 menit menutupi semuanya, sehingga verifikasi email yang
+	// butuh beberapa langkah (buka link di tab baru, dsb) kehabisan waktu.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutMin)*time.Minute)
+	defer cancel()
+	fmt.Printf("batas waktu login: %d menit (ubah dengan --timeout)\n", *timeoutMin)
+
 	// 2) cari port dari ALL_PORTS (harus terdaftar di OAuth client Z.ai)
+	//    Port-port ini sering dipegang AutoClaw desktop. Kalau IPv4 loopback
+	//    terpakai, coba IPv6 [::1] pada port yang sama: localhost me-resolve
+	//    127.0.0.1 dulu, lalu fallback ke ::1, jadi callback tetap nyangkut.
 	allPorts := []int{18432, 19654, 19723, 53699}
 	var actualPort int
 	var ln net.Listener
 	var errPort error
+	bind := func(host string, p int) (net.Listener, error) {
+		return net.Listen("tcp", fmt.Sprintf("%s:%d", host, p))
+	}
 	if loginPort == 0 {
-		// coba port-port app asli dulu
+		// coba port-port app asli dulu (IPv4 lalu IPv6)
 		for _, p := range allPorts {
-			ln, errPort = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+			ln, errPort = bind("127.0.0.1", p)
 			if errPort == nil {
 				actualPort = p
+				break
+			}
+			ln, errPort = bind("[::1]", p)
+			if errPort == nil {
+				actualPort = p
+				fmt.Printf("catatan: :%d IPv4 terpakai, pakai IPv6 [::1]\n", p)
 				break
 			}
 		}
 		// fallback ke random port kalo semua terpakai (tapi redirect URI rejected)
 		if ln == nil {
-			ln, errPort = net.Listen("tcp", "127.0.0.1:0")
+			ln, errPort = bind("127.0.0.1", 0)
 			if errPort != nil {
 				return fmt.Errorf("gak bisa dengerin port: %w", errPort)
 			}
@@ -71,41 +96,49 @@ func cmdLogin(args []string) error {
 			fmt.Println("PERINGATAN: redirect URI mungkin ditolak karena port gak terdaftar")
 		}
 	} else {
-		ln, errPort = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", loginPort))
+		ln, errPort = bind("127.0.0.1", loginPort)
 		if errPort != nil {
-			return fmt.Errorf("port %d terpakai: %w", loginPort, errPort)
+			ln, errPort = bind("[::1]", loginPort)
+			if errPort != nil {
+				return fmt.Errorf("port %d terpakai (IPv4 & IPv6): %w", loginPort, errPort)
+			}
+			fmt.Printf("catatan: :%d IPv4 terpakai, pakai IPv6 [::1]\n", loginPort)
 		}
 		actualPort = loginPort
 	}
-	_ = ln.Close() // nanti start ulang
 
 	h := &loginHandler{
-		cl:         cl,
-		cfg:        cfg,
-		vendor:     *vendor,
-		codeCh:     make(chan string, 1),
-		verifyCh:   make(chan string, 1),
-		serverPort: actualPort,
+		cl:          cl,
+		cfg:         cfg,
+		vendor:      *vendor,
+		codeCh:      make(chan string, 1),
+		verifyCh:    make(chan string, 1),
+		serverPort:  actualPort,
 		navigateURI: fmt.Sprintf("http://localhost:%d/auth/callback-%s", actualPort, *vendor),
 	}
 
 	// 3) start HTTP server
+	//    Pakai listener yang sudah ter-bind apa adanya — jangan close lalu
+	//    listen ulang: host-nya (IPv4/IPv6) bisa berubah dan ada race di
+	//    antara close dan re-bind.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.handleRoot)
 	mux.HandleFunc("/captcha-result", h.handleCaptchaResult)
 	mux.HandleFunc(fmt.Sprintf("/auth/callback-%s", *vendor), h.handleOAuthCallback)
 
 	srv := &http.Server{Handler: mux}
-	ln2, _ := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", actualPort))
-	go func() { _ = srv.Serve(ln2) }()
+	go func() { _ = srv.Serve(ln) }()
 	defer srv.Close()
 
 	// 4) buka browser ke captcha page
 	captchaURL := fmt.Sprintf("http://localhost:%d/?scene=%s&prefix=%s&supplier=%s",
 		actualPort, capCfg.Data.SceneID, capCfg.Data.Prefix, capCfg.Data.Supplier)
-	fmt.Printf("\nbuka di browser: %s\n", captchaURL)
-	fmt.Println("solve captcha-nya, nanti lanjut OAuth otomatis.")
-	openBrowser(captchaURL)
+	fmt.Printf("\n[1/2] Buka URL captcha berikut di browser pilihan Anda:\n\n  %s\n\n", captchaURL)
+	fmt.Println("Selesaikan captcha-nya; setelah itu OAuth lanjut otomatis.")
+	fmt.Printf("(server callback lokal di http://localhost:%d — browser harus di mesin yang sama)\n", actualPort)
+	if !*noBrowser {
+		openBrowser(captchaURL)
+	}
 
 	// 5) tunggu verifyParam
 	var verifyParam string
@@ -128,8 +161,10 @@ func cmdLogin(args []string) error {
 		return fmt.Errorf("oauth-url: %w", err)
 	}
 	h.stateValue = oauthState // pake state dari server, bukan generate sendiri
-	fmt.Println("buka browser ke:", oauthURL)
-	openBrowser(oauthURL)
+	fmt.Printf("\n[2/2] Buka URL OAuth berikut di browser pilihan Anda:\n\n  %s\n\n", oauthURL)
+	if !*noBrowser {
+		openBrowser(oauthURL)
+	}
 
 	// 7) tunggu callback
 	select {
@@ -137,9 +172,11 @@ func cmdLogin(args []string) error {
 		if code == "" {
 			return fmt.Errorf("callback tanpa code")
 		}
-		return finishLogin(ctx, cl, *vendor, code, h.stateValue, h.navigateURI)
+		return finishLogin(ctx, cl, *vendor, code, h.stateValue, h.navigateURI, *replace, *name, *proxyURL)
 	case <-ctx.Done():
-		return fmt.Errorf("timeout menunggu OAuth callback")
+		return fmt.Errorf("timeout menunggu OAuth callback (%d menit habis). "+
+			"Kalau verifikasi email butuh lebih lama, jalankan ulang dengan "+
+			"--timeout <menit> yang lebih besar, mis. --timeout 30", *timeoutMin)
 	}
 }
 

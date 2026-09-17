@@ -323,16 +323,16 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			if err == nil && id > 0 {
 				switch parts[1] {
 				case "delete":
-								db.DeleteAccount(id)
-								http.Redirect(w, r, "/accounts", http.StatusSeeOther)
-								return
-							case "refresh":
-								refreshBalance(id)
-								w.WriteHeader(204)
-								return
-							case "claim":
-								s.handleClaim100MForAccount(w, r, id)
-								return
+					db.DeleteAccount(id)
+					http.Redirect(w, r, "/accounts", http.StatusSeeOther)
+					return
+				case "refresh":
+					refreshBalance(id)
+					w.WriteHeader(204)
+					return
+				case "claim":
+					s.handleClaim100MForAccount(w, r, id)
+					return
 				}
 			}
 		}
@@ -449,9 +449,9 @@ func (s *Server) handleAccountsLoginStart(w http.ResponseWriter, r *http.Request
 		sceneID = capCfg.Data.SceneID
 	}
 	s.renderTemplate(w, "login.html", "login", map[string]any{
-		"Flow":    "captcha",
-		"Prefix":  prefix,
-		"SceneID": sceneID,
+		"Flow":     "captcha",
+		"Prefix":   prefix,
+		"SceneID":  sceneID,
 		"LoginURL": "/accounts/login/captcha-result",
 	})
 }
@@ -694,9 +694,6 @@ func (s *Server) handleCheckinRun(w http.ResponseWriter, r *http.Request) {
 	today := time.Now().UTC().Format("2006-01-02")
 	tasks := []struct{ ID, Name string }{
 		{"daily_signin", "Daily Check-In"},
-		{"daily_inspiration_center", "Inspiration Hub"},
-		{"newbie_cloud_lobster", "Cloud Lobster"},
-		{"newbie_local_lobster", "Local Lobster"},
 	}
 
 	for _, a := range accounts {
@@ -715,7 +712,7 @@ func (s *Server) handleCheckinRun(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-			points, alreadyDone, err := s.cl.ClaimTask(ctx, a.AccessToken, t.ID)
+			points, alreadyDone, err := s.cl.ClaimTaskVia(ctx, a.AccessToken, t.ID, a.Proxy)
 			cancel()
 			if err != nil {
 				ar.Tasks = append(ar.Tasks, taskResult{Name: t.Name, Points: 0, Success: false, Status: "failed: " + err.Error()})
@@ -732,6 +729,26 @@ func (s *Server) handleCheckinRun(w http.ResponseWriter, r *http.Request) {
 			db.UpdatePoints(a.ID, a.Points+points)
 			ar.BalanceAfter += points
 		}
+
+		// Inspiration Hub: endpoint beda (dua langkah, butuh inspiration_id).
+		if existing, _ := db.GetCheckinLog(a.ID, today, "daily_inspiration_center"); existing == nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+			pts, alreadyDone, err := s.claimInspiration(ctx, a)
+			cancel()
+			switch {
+			case err != nil:
+				ar.Tasks = append(ar.Tasks, taskResult{Name: "Inspiration Hub", Success: false, Status: "failed: " + err.Error()})
+				db.AddCheckinLog(a.ID, today, "daily_inspiration_center", 0, "failed: "+err.Error(), a.DeviceID)
+			case alreadyDone:
+				ar.Tasks = append(ar.Tasks, taskResult{Name: "Inspiration Hub", Success: true, Status: "already"})
+				db.AddCheckinLog(a.ID, today, "daily_inspiration_center", 0, "already", a.DeviceID)
+			default:
+				ar.Tasks = append(ar.Tasks, taskResult{Name: "Inspiration Hub", Points: pts, Success: true, Status: "claimed"})
+				db.AddCheckinLog(a.ID, today, "daily_inspiration_center", pts, "success", a.DeviceID)
+				db.UpdatePoints(a.ID, a.Points+pts)
+				ar.BalanceAfter += pts
+			}
+		}
 		if ar.BalanceAfter == 0 {
 			ar.BalanceAfter = ar.BalanceBefore
 		}
@@ -740,6 +757,27 @@ func (s *Server) handleCheckinRun(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "checkin.html", "checkin", map[string]any{
 		"Results": results,
 	})
+}
+
+// claimInspiration mengklaim daily_inspiration_center untuk satu akun.
+// Alur dua langkah: ambil inspiration_id → klaim reward.
+// Return (points, alreadyDone, error).
+func (s *Server) claimInspiration(ctx context.Context, a db.Account) (int, bool, error) {
+	items, err := s.cl.InspirationCenter(ctx, a.AccessToken, a.Proxy)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(items) == 0 {
+		return 0, false, fmt.Errorf("tidak ada item inspirasi")
+	}
+	already, err := s.cl.ClaimInspirationReward(ctx, a.AccessToken, items[0].InspirationID, a.Proxy)
+	if err != nil {
+		return 0, false, err
+	}
+	if already {
+		return 0, true, nil
+	}
+	return items[0].RewardPoints, false, nil
 }
 
 func ifEmpty(s, fallback string) string {
@@ -856,10 +894,10 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	logs, _ := db.ListLogs(100)
 	totalReq, totalTokens, totalCost, _ := db.LogStats()
 	s.renderTemplate(w, "logs.html", "logs", map[string]any{
-		"Logs":       logs,
-		"TotalReq":   totalReq,
+		"Logs":        logs,
+		"TotalReq":    totalReq,
 		"TotalTokens": totalTokens,
-		"TotalCost":  totalCost,
+		"TotalCost":   totalCost,
 	})
 }
 

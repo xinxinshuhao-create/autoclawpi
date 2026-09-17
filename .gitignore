@@ -1,4 +1,7 @@
 /autoclawpi
+/autoclawpi-*
+/autoclawpi.exe
+*.exe
 /tmp/
 *.db
 *.db-journal
@@ -6,3 +9,6 @@
 *.db-shm
 .env
 credentials.json
+serve.log
+serve.err.log
+*.bak-*

@@ -153,6 +153,8 @@ autoclawpi
 │   ├── store/            # Credential storage (AES-GCM encrypted)
 │   └── web/              # Web management panel
 │       └── templates/    # HTML templates (glassmorphism dark theme)
+├── DISCLAIMER.md         # Legal disclaimer (EN + 中文)
+├── LICENSE               # masantoid license
 └── go.mod
 ```
 
@@ -295,5 +297,28 @@ All 7 models verified live via inference (2026-09-05):
 masantoid — see [LICENSE](LICENSE) file for details.
 
 ---
+
+## Disclaimer
+
+This is an **unofficial, independent** project. It is not created by, endorsed by, or
+affiliated with the upstream service provider in any way.
+
+**What it does:** runs a local proxy on your own machine that automates an OAuth login
+flow for an account **you own**, stores the resulting token locally, and forwards
+**your own** API requests.
+
+**What it does NOT do:** it does not bypass or circumvent any authentication mechanism,
+does not grant access to any account other than your own, and does not crack or exploit
+the service. Using it with credentials you do not own is strictly prohibited.
+
+**Your responsibility:** use it only with accounts you own; comply with the upstream
+service's Terms of Service; your account may be rate-limited or suspended as a result of
+automated access, and you accept that risk knowingly.
+
+The software is provided **"AS IS"**, without warranty of any kind. The authors accept
+**no liability** for any loss of account access, data, tokens, credits, or any other
+damages arising from its use.
+
+See [DISCLAIMER.md](DISCLAIMER.md) for the full terms (English + 中文).
 
 *Built by masanto*

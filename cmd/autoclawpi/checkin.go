@@ -2,25 +2,35 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
-	"strings"
 	"time"
 
+	"github.com/hirotomasato/autoclawpi/internal/client"
 	"github.com/hirotomasato/autoclawpi/internal/db"
-	"github.com/hirotomasato/autoclawpi/internal/sign"
 )
 
-// task yang bisa di-check-in
+// checkinTasks = tugas HARIAN saja.
+//
+// Tugas newbie (newbie_cloud_lobster / newbie_local_lobster) TIDAK di sini:
+// itu reward sekali seumur akun, jadi diklaim SEKALI saat akun ditambahkan
+// (lihat claimNewbieRewards di main.go / finishLogin). Menaruhnya di sini
+// membuat setiap checkin harian memanggil upstream untuk tugas yang sudah
+// pasti "already" — request sia-sia yang menambah pola perilaku teratur
+// (pola berulang adalah salah satu pemicu utama pemblokiran akun).
 var checkinTasks = []struct {
 	ID     string
 	Points int
 }{
 	{"daily_signin", 400},
-	{"daily_inspiration_center", 200},
+}
+
+// newbieTasks = reward sekali seumur akun, diklaim sekali saat akun
+// ditambahkan (lihat claimNewbieRewards di main.go).
+var newbieTasks = []struct {
+	ID     string
+	Points int
+}{
 	{"newbie_cloud_lobster", 500},
 	{"newbie_local_lobster", 500},
 }
@@ -39,6 +49,7 @@ func cmdCheckin(args []string) error {
 		return fmt.Errorf("tidak ada akun, login dulu")
 	}
 
+	_, cl := loadAll()
 	today := time.Now().UTC().Format("2006-01-02")
 	anyClaimed := false
 
@@ -56,39 +67,29 @@ func cmdCheckin(args []string) error {
 			continue
 		}
 
-		// fetch saldo sebelum check-in
-		balance, _ := fetchBalance(a.AccessToken)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		balance, _ := cl.FetchBalance(ctx, a.AccessToken, a.Proxy)
+		cancel()
 		fmt.Printf("  Saldo: %d pts\n", balance)
 
 		for _, task := range checkinTasks {
-			// cek apakah udah check-in hari ini
-			existing, _ := db.GetCheckinLog(a.ID, today, task.ID)
-			if existing != nil {
-				fmt.Printf("  %s: sudah (%d pts)\n", task.ID, existing.Points)
-				continue
+			if claimed, ok := claimOne(cl, a, today, task.ID, *dryRun); ok {
+				anyClaimed = anyClaimed || claimed
 			}
-
-			if *dryRun {
-				fmt.Printf("  %s: akan klaim %d pts\n", task.ID, task.Points)
-				continue
-			}
-
-			// klaim
-			points, err := claimTask(a, task.ID)
-			if err != nil {
-				fmt.Printf("  %s: GAGAL — %v\n", task.ID, err)
-				db.AddCheckinLog(a.ID, today, task.ID, 0, "failed:"+err.Error(), a.DeviceID)
-				continue
-			}
-
-			fmt.Printf("  %s: ✅ %d pts\n", task.ID, points)
-			db.AddCheckinLog(a.ID, today, task.ID, points, "success", a.DeviceID)
-			anyClaimed = true
 		}
 
-		// fetch saldo setelah check-in (update)
+		// daily_inspiration_center: endpoint beda (butuh inspiration_id).
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
+		claimed, pts, note := claimInspiration(ctx, cl, a, today, *dryRun)
+		cancel()
+		fmt.Printf("  daily_inspiration_center: %s\n", note)
+		anyClaimed = anyClaimed || claimed
+		_ = pts
+
 		if !*dryRun {
-			newBalance, _ := fetchBalance(a.AccessToken)
+			ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			newBalance, _ := cl.FetchBalance(ctx, a.AccessToken, a.Proxy)
+			cancel()
 			if newBalance > balance {
 				db.UpdatePoints(a.ID, newBalance)
 			}
@@ -102,89 +103,73 @@ func cmdCheckin(args []string) error {
 	return nil
 }
 
-// fetchBalance mengambil saldo dari server.
-func fetchBalance(token string) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	hdrs := commonHeaders(token)
-	req, _ := http.NewRequestWithContext(ctx, "GET",
-		"https://autoglm-api.autoglm.ai/agent-assetmgr/api/v1/wallet-instances?biz_app_id=autoclaw", nil)
-	for k, v := range hdrs {
-		req.Header.Set(k, v)
+// claimOne menangani task biasa (lewat autoclaw-task-complete).
+// Return (claimed, ok): ok=false kalau error sudah dilaporkan.
+func claimOne(cl *client.Client, a db.Account, today, taskID string, dryRun bool) (bool, bool) {
+	existing, _ := db.GetCheckinLog(a.ID, today, taskID)
+	if existing != nil {
+		fmt.Printf("  %s: sudah (%d pts)\n", taskID, existing.Points)
+		return false, true
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, err
+	if dryRun {
+		fmt.Printf("  %s: akan klaim\n", taskID)
+		return false, true
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var r struct {
-		Data *struct {
-			TotalBalance int `json:"total_balance"`
-		} `json:"data"`
-	}
-	json.Unmarshal(b, &r)
-	if r.Data != nil {
-		return r.Data.TotalBalance, nil
-	}
-	return 0, nil
-}
 
-// claimTask mengirim POST task-complete dan mengembalikan points.
-func claimTask(a db.Account, taskID string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	hdrs := commonHeaders(a.AccessToken)
-	body := fmt.Sprintf(`{"task_id":"%s"}`, taskID)
-
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		"https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw-task-complete",
-		strings.NewReader(body))
+	points, already, err := cl.ClaimTaskVia(ctx, a.AccessToken, taskID, a.Proxy)
+	cancel()
 	if err != nil {
-		return 0, err
+		fmt.Printf("  %s: GAGAL — %v\n", taskID, err)
+		db.AddCheckinLog(a.ID, today, taskID, 0, "failed:"+err.Error(), a.DeviceID)
+		return false, false
 	}
-	for k, v := range hdrs {
-		req.Header.Set(k, v)
+	if already {
+		fmt.Printf("  %s: sudah diklaim\n", taskID)
+		db.AddCheckinLog(a.ID, today, taskID, 0, "already", a.DeviceID)
+		return false, true
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-	var result struct {
-		Data *struct {
-			Success         bool   `json:"success"`
-			AlreadyComplete bool   `json:"already_completed"`
-			RewardPoints    int    `json:"reward_points"`
-			TaskID          string `json:"task_id"`
-		} `json:"data"`
-	}
-	json.Unmarshal(b, &result)
-
-	if result.Data == nil {
-		return 0, fmt.Errorf("response: %s", string(b))
-	}
-	if result.Data.AlreadyComplete {
-		return 0, nil // udah check-in, catat aja
-	}
-	if !result.Data.Success {
-		return 0, fmt.Errorf("server: success=false")
-	}
-	return result.Data.RewardPoints, nil
+	fmt.Printf("  %s: ✅ %d pts\n", taskID, points)
+	db.AddCheckinLog(a.ID, today, taskID, points, "success", a.DeviceID)
+	return points > 0, true
 }
 
-// commonHeaders membangun header yang sama kayak app asli (commonHeaders).
-func commonHeaders(token string) map[string]string {
-	ts := time.Now().Unix()
-	h := sign.HeadersAt(ts)
-	h["X-Lang"] = "en"
-	h["X-Client-Type"] = "pc"
-	h["authorization"] = token // lowercase!
-	delete(h, "Accept")        // gak di commonHeaders
-	return h
+// claimInspiration menangani daily_inspiration_center.
+//
+// Alurnya dua langkah (beda dari task lain):
+//  1. POST /agentdr/v1/assistant/inspiration-center         → ambil inspiration_id
+//  2. POST /agentdr/v1/assistant/inspiration-task-complete  → {"inspiration_id": ...}
+//
+// Endpoint autoclaw-task-complete TIDAK berlaku di sini: dulu dipakai dan
+// hasilnya reward 0 + status task jadi "completed" palsu.
+func claimInspiration(ctx context.Context, cl *client.Client, a db.Account, today string, dryRun bool) (bool, int, string) {
+	const taskID = "daily_inspiration_center"
+
+	if existing, _ := db.GetCheckinLog(a.ID, today, taskID); existing != nil {
+		return false, 0, fmt.Sprintf("sudah (%d pts)", existing.Points)
+	}
+
+	items, err := cl.InspirationCenter(ctx, a.AccessToken, a.Proxy)
+	if err != nil {
+		return false, 0, "GAGAL ambil daftar — " + err.Error()
+	}
+	if len(items) == 0 {
+		return false, 0, "tidak ada item inspirasi"
+	}
+	if dryRun {
+		return false, 0, fmt.Sprintf("akan klaim %d pts (%s)", items[0].RewardPoints, items[0].InspirationID[:8])
+	}
+
+	already, err := cl.ClaimInspirationReward(ctx, a.AccessToken, items[0].InspirationID, a.Proxy)
+	if err != nil {
+		db.AddCheckinLog(a.ID, today, taskID, 0, "failed:"+err.Error(), a.DeviceID)
+		return false, 0, "GAGAL — " + err.Error()
+	}
+	if already {
+		db.AddCheckinLog(a.ID, today, taskID, 0, "already", a.DeviceID)
+		return false, 0, "sudah diklaim"
+	}
+	pts := items[0].RewardPoints
+	db.AddCheckinLog(a.ID, today, taskID, pts, "success", a.DeviceID)
+	return pts > 0, pts, fmt.Sprintf("✅ %d pts", pts)
 }
