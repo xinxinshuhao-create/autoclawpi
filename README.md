@@ -36,6 +36,7 @@
 
 ### 📚 Documentation
 - [CPA gateway integration](docs/CPA-INTEGRATION.md) — using autoclawpi as a channel behind a CPA-style gateway
+- [Egress IP pool design](docs/EGRESS-POOL-DESIGN.md) — why each account gets its own outbound IP, and how the pool is built
 
 ### 🔐 Security
 - Web panel password protection
@@ -159,7 +160,8 @@ autoclawpi
 ├── DISCLAIMER.md         # Legal disclaimer (EN + 中文)
 ├── LICENSE               # masantoid license
 ├── docs/
-│   └── CPA-INTEGRATION.md # Using autoclawpi behind a CPA-style gateway
+│   ├── CPA-INTEGRATION.md # Using autoclawpi behind a CPA-style gateway
+│   └── EGRESS-POOL-DESIGN.md # Per-account egress isolation design notes
 └── go.mod
 ```
 
