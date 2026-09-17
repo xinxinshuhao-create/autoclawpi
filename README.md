@@ -34,6 +34,9 @@
 - **API Docs** — endpoint reference with curl examples
 - **Responsive** — collapsible sidebar, adaptive layout
 
+### 📚 Documentation
+- [CPA gateway integration](docs/CPA-INTEGRATION.md) — using autoclawpi as a channel behind a CPA-style gateway
+
 ### 🔐 Security
 - Web panel password protection
 - API key authentication for OpenAI endpoint
@@ -155,6 +158,8 @@ autoclawpi
 │       └── templates/    # HTML templates (glassmorphism dark theme)
 ├── DISCLAIMER.md         # Legal disclaimer (EN + 中文)
 ├── LICENSE               # masantoid license
+├── docs/
+│   └── CPA-INTEGRATION.md # Using autoclawpi behind a CPA-style gateway
 └── go.mod
 ```
 
