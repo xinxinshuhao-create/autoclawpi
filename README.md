@@ -13,8 +13,12 @@
 ## Features
 
 ### 🤖 OpenAI-Compatible API
-- Drop-in replacement for OpenAI client — use any OpenAI library
-- 7 verified models: `auto`, `auto-fast`, `glm-5-turbo`, `glm-5.3`, `glm-5.3-flash`, `deepseek-v4-pro`, `deepseek-v4-flash`
+- Drop-in replacement for OpenAI client — use any OpenAI library, CLI, or coding agent
+- Verified models: `glm-5.3`, `glm-5.3-flash`, `deepseek-v4.1-flash`, `deepseek-v4-pro`, `auto`, `auto-fast`
+- Full tool calling / function calling support (streaming SSE and non-streaming)
+- Compatible with coding agents (pi, Cline, Cursor, Roo Code, Continue, Aider)
+- Upstream WAF bypass (OpenClaw banner injection & harness preamble sanitization)
+- Automatic reasoning budget headroom & empty-content recovery
 - Round-robin load balancing across accounts
 - Auto token refresh on 401
 - Token usage tracking & cost estimation
@@ -50,18 +54,41 @@
 
 ### Prerequisites
 - Go 1.26+ (for building from source)
-- Linux (tested on Zorin OS 18.1)
+- Windows 10/11 or Linux
 
-### Install
+### Install & Build
 
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/IngKevinDavid/autoclawpi.git
+cd autoclawpi
+
+# Automated build script:
+.\install.ps1
+
+# Or manual compilation:
+go build -o autoclawpi.exe ./cmd/autoclawpi
+```
+
+**Linux:**
 ```bash
-git clone https://github.com/hirotomasato/autoclawpi.git
+git clone https://github.com/IngKevinDavid/autoclawpi.git
 cd autoclawpi
 go build -o ~/.local/bin/autoclawpi ./cmd/autoclawpi
 ```
 
 ### Run
 
+**Windows (PowerShell):**
+```powershell
+# Quick start with default settings (port 8787, password: admin):
+.\start-server.ps1
+
+# Or with custom options:
+.\start-server.ps1 -Port 8787 -WebPassword "yourpassword" -ApiKey "sk-your-key"
+```
+
+**Linux / CLI:**
 ```bash
 # Start server with password
 autoclawpi serve --port 8787 --web-password yourpassword
@@ -239,19 +266,18 @@ All data is stored in SQLite at `~/.autoclawpi/autoclawpi.db`:
 
 ## Models
 
-All 7 models verified live via inference (2026-09-05):
+All models verified live via upstream inference (September 2026):
 
-| Model | Route ID | Auto-routing | Status |
-|-------|----------|-------------|--------|
-| `auto` | `zai_auto` | → glm-5.3-flash | ✅ |
-| `auto-fast` | `zai_auto-fast` | → deepseek-v4-flash | ✅ |
-| `glm-5-turbo` | `zai_glm-5-turbo` | — | ✅ |
-| `glm-5.3` | `zaicoding_glm-5.3` | — | ✅ |
-| `glm-5.3-flash` | `zai_glm-5.3-flash` | — | ✅ |
-| `deepseek-v4-pro` | `tdpsk_deepseek-v4-pro-202606` | — | ✅ |
-| `deepseek-v4-flash` | `tdpsk_deepseek-v4-flash-202605` | — | ✅ |
+| Model | Route ID | Description | Input | Status |
+|-------|----------|-------------|-------|--------|
+| `glm-5.3` | `zaicoding_glm-5.3` | Flagship coding & multi-step complex reasoning | Text | ✅ Active |
+| `glm-5.3-flash` | `zai_glm-5.3-flash` | Fast multimodal reasoning | Text, Image | ✅ Active |
+| `deepseek-v4.1-flash` *(or `deepseek-v4-flash`)* | `tdpsk_deepseek-v4-flash-202605` | Fast & cost-efficient for tools and agent workflows | Text | ✅ Active |
+| `deepseek-v4-pro` *(or `deepseek-v4`)* | `tdpsk_deepseek-v4-pro-202606` | DeepSeek flagship reasoning for complex tasks | Text | ✅ Active |
+| `auto` | `zai_auto` | Intelligent task-based automatic routing | Text | ✅ Active |
+| `auto-fast` | `zai_auto-fast` | Speed-prioritized automatic multimodal routing | Text, Image | ✅ Active |
 
----
+> **Note on Deprecated Models:** Legacy models `glm-5-turbo` and `glm-5.2` have been discontinued by the upstream service and return HTTP 400 (`非法模型`). They have been removed from `/v1/models`.
 
 ## Screenshots
 

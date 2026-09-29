@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -113,6 +114,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// enable_thinking=false justru membuat reasoning membengkak ~8x
 	// (2262 -> 18127 rune) dan content tetap kosong.
 	upstreamBody = addReasoningHeadroom(upstreamBody)
+	upstreamBody = injectSystemBanner(upstreamBody)
 
 	// Round-robin: coba setiap akun hingga salah satu berhasil
 	accounts, _ := db.ListAccounts()
@@ -340,6 +342,7 @@ func (s *Server) forward(ctx context.Context, acct db.Account, route string, bod
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
+		log.Printf("[autoclawpi] upstream HTTP %d (route=%s acct=%d): %s", resp.StatusCode, route, acct.ID, string(b))
 		// Upstream membalas 403 + code 810002 untuk "high demand" (antrean
 		// sementara), bukan pembayaran. CPA memetakan 403 -> payment_required
 		// lalu MENANGGUHKAN seluruh channel (semua model), jadi salah klasifikasi
@@ -522,6 +525,108 @@ func addReasoningHeadroom(body []byte) []byte {
 		}
 	}
 
+	out, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+const systemPromptBanner = "You are a personal assistant running inside OpenClaw.\n\n## Tooling"
+
+var (
+	reHarnessInside = regexp.MustCompile(`(?i)(?:operating\s+)?inside\s+(?:pi|cline|cursor|continue|aider|windsurf|claude[-_]?code)\b`)
+	reHarnessAgent  = regexp.MustCompile(`(?i)\b(?:pi|cline|cursor|continue|aider|windsurf|claude[-_]?code),\s+a\s+coding\s+agent\s+harness\b`)
+)
+
+func sanitizeHarnessPreamble(content string) string {
+	content = reHarnessInside.ReplaceAllString(content, "operating inside OpenClaw")
+	content = reHarnessAgent.ReplaceAllString(content, "OpenClaw, a coding agent harness")
+	return content
+}
+
+func sanitizeMsgContent(content any) any {
+	switch c := content.(type) {
+	case string:
+		return sanitizeHarnessPreamble(c)
+	case []any:
+		newParts := make([]any, len(c))
+		for j, p := range c {
+			if pMap, ok := p.(map[string]any); ok {
+				if t, ok := pMap["type"].(string); ok && t == "text" {
+					if txt, ok := pMap["text"].(string); ok {
+						pCopy := make(map[string]any, len(pMap))
+						for k, v := range pMap {
+							pCopy[k] = v
+						}
+						pCopy["text"] = sanitizeHarnessPreamble(txt)
+						newParts[j] = pCopy
+						continue
+					}
+				}
+			}
+			newParts[j] = p
+		}
+		return newParts
+	default:
+		return content
+	}
+}
+
+// injectSystemBanner memastikan system prompt diawali banner OpenClaw
+// yang diwajibkan oleh gateway upstream untuk menghindari HTTP 406.
+// Juga menormalisasi role "developer" menjadi "system" dan membersihkan
+// signature harness kompetitor (pi, cline, cursor, dll) yang diblokir WAF.
+func injectSystemBanner(body []byte) []byte {
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+	rawMsgs, ok := data["messages"].([]any)
+	if !ok || len(rawMsgs) == 0 {
+		data["messages"] = []any{
+			map[string]any{"role": "system", "content": systemPromptBanner},
+		}
+		if out, err := json.Marshal(data); err == nil {
+			return out
+		}
+		return body
+	}
+
+	foundSystem := false
+	for i, m := range rawMsgs {
+		msgMap, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msgMap["role"].(string)
+		if role == "developer" {
+			role = "system"
+			msgMap["role"] = "system"
+		}
+		if role == "system" {
+			msgMap["content"] = sanitizeMsgContent(msgMap["content"])
+			if !foundSystem {
+				foundSystem = true
+				if strContent, ok := msgMap["content"].(string); ok {
+					if !strings.Contains(strContent, systemPromptBanner) {
+						msgMap["content"] = systemPromptBanner + "\n\n" + strContent
+					}
+				}
+			}
+			rawMsgs[i] = msgMap
+		}
+	}
+
+	if !foundSystem {
+		systemMsg := map[string]any{
+			"role":    "system",
+			"content": systemPromptBanner,
+		}
+		rawMsgs = append([]any{systemMsg}, rawMsgs...)
+	}
+
+	data["messages"] = rawMsgs
 	out, err := json.Marshal(data)
 	if err != nil {
 		return body
@@ -879,17 +984,17 @@ func logUsage(acctID int64, model string, body []byte) {
 
 // handleModels menangani /v1/models.
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
-	// Model yang sudah diverifikasi bisa inference (2026-09-05).
-	// CATATAN (2026-09-15): "glm-5-turbo" dihapus — diverifikasi 400 非法模型
-	// di semua varian route id (zai_/zaicoding_glm-5-turbo, glm-4.6, glm-4.5, ...),
-	// jadi model ini tidak lagi ada di upstream. Jangan iklankan sebagai tersedia.
+	// Model yang sudah diverifikasi aktif di upstream AutoClaw (2026-09-28).
+	// glm-5.3, glm-5.3-flash, deepseek-v4.1-flash, deepseek-v4-pro, auto, auto-fast.
 	models := []map[string]any{
-		{"id": "auto", "object": "model", "created": 1, "owned_by": "autoclaw"},
-		{"id": "auto-fast", "object": "model", "created": 1, "owned_by": "autoclaw"},
 		{"id": "glm-5.3", "object": "model", "created": 1, "owned_by": "autoclaw"},
 		{"id": "glm-5.3-flash", "object": "model", "created": 1, "owned_by": "autoclaw"},
-		{"id": "deepseek-v4-pro", "object": "model", "created": 1, "owned_by": "autoclaw"},
+		{"id": "deepseek-v4.1-flash", "object": "model", "created": 1, "owned_by": "autoclaw"},
 		{"id": "deepseek-v4-flash", "object": "model", "created": 1, "owned_by": "autoclaw"},
+		{"id": "deepseek-v4-pro", "object": "model", "created": 1, "owned_by": "autoclaw"},
+		{"id": "deepseek-v4", "object": "model", "created": 1, "owned_by": "autoclaw"},
+		{"id": "auto", "object": "model", "created": 1, "owned_by": "autoclaw"},
+		{"id": "auto-fast", "object": "model", "created": 1, "owned_by": "autoclaw"},
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": models})
 }

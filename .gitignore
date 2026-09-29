@@ -2,6 +2,7 @@
 /autoclawpi-*
 /autoclawpi.exe
 *.exe
+*.exe~
 /tmp/
 *.db
 *.db-journal

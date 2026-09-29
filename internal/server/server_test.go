@@ -157,7 +157,9 @@ func TestRouteID_VerifiedModels(t *testing.T) {
 		"glm-5.3":           "zaicoding_glm-5.3",
 		"glm-5.3-flash":     "zai_glm-5.3-flash",
 		"deepseek-v4-pro":   "tdpsk_deepseek-v4-pro-202606",
+		"deepseek-v4":       "tdpsk_deepseek-v4-pro-202606",
 		"deepseek-v4-flash": "tdpsk_deepseek-v4-flash-202605",
+		"deepseek-v4.1-flash": "tdpsk_deepseek-v4-flash-202605",
 	}
 	for model, wantRoute := range cases {
 		got := client.RouteID(model)
@@ -223,3 +225,92 @@ func TestUpstreamErrCode_Other(t *testing.T) {
 		}
 	}
 }
+
+func TestInjectSystemBanner(t *testing.T) {
+	// Case 1: no messages -> add system banner
+	body1 := []byte(`{"model":"auto","messages":[]}`)
+	res1 := injectSystemBanner(body1)
+	var data1 struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(res1, &data1); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if len(data1.Messages) != 1 || data1.Messages[0].Content != systemPromptBanner {
+		t.Fatalf("expected banner in empty messages, got %+v", data1.Messages)
+	}
+
+	// Case 2: only user message -> prepend system banner
+	body2 := []byte(`{"model":"auto","messages":[{"role":"user","content":"hi"}]}`)
+	res2 := injectSystemBanner(body2)
+	var data2 struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(res2, &data2); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if len(data2.Messages) != 2 || data2.Messages[0].Role != "system" || !strings.Contains(data2.Messages[0].Content, systemPromptBanner) {
+		t.Fatalf("expected prepended system banner, got %+v", data2.Messages)
+	}
+
+	// Case 3: existing system message -> prepend banner to existing content
+	body3 := []byte(`{"model":"auto","messages":[{"role":"system","content":"custom"},{"role":"user","content":"hi"}]}`)
+	res3 := injectSystemBanner(body3)
+	var data3 struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(res3, &data3); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if len(data3.Messages) != 2 || !strings.Contains(data3.Messages[0].Content, "custom") || !strings.Contains(data3.Messages[0].Content, systemPromptBanner) {
+		t.Fatalf("expected merged system message, got %+v", data3.Messages)
+	}
+
+	// Case 4: developer role -> normalize to system and prepend banner
+	body4 := []byte(`{"model":"auto","messages":[{"role":"developer","content":"rules"},{"role":"user","content":"hi"}]}`)
+	res4 := injectSystemBanner(body4)
+	var data4 struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(res4, &data4); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if len(data4.Messages) != 2 || data4.Messages[0].Role != "system" || !strings.Contains(data4.Messages[0].Content, "rules") || !strings.Contains(data4.Messages[0].Content, systemPromptBanner) {
+		t.Fatalf("expected normalized system message, got %+v", data4.Messages)
+	}
+
+	// Case 5: competitor harness signature -> sanitized
+	body5 := []byte(`{"model":"auto","messages":[{"role":"system","content":"You are an expert coding assistant operating inside pi, a coding agent harness."}]}`)
+	res5 := injectSystemBanner(body5)
+	var data5 struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(res5, &data5); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if strings.Contains(data5.Messages[0].Content, "operating inside pi") {
+		t.Errorf("expected 'operating inside pi' to be sanitized, got: %s", data5.Messages[0].Content)
+	}
+	if !strings.Contains(data5.Messages[0].Content, "operating inside OpenClaw") {
+		t.Errorf("expected 'operating inside OpenClaw', got: %s", data5.Messages[0].Content)
+	}
+	if !strings.Contains(data5.Messages[0].Content, systemPromptBanner) {
+		t.Errorf("expected systemPromptBanner, got: %s", data5.Messages[0].Content)
+	}
+}
+
